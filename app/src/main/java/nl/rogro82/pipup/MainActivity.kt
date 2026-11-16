@@ -49,27 +49,12 @@ class MainActivity : Activity() {
 
         // start service in foreground
 
-        val textViewConnection = findViewById<TextView>(R.id.textViewConnection)
-        val textViewServerAddress = findViewById<TextView>(R.id.textViewServerAddress)
+        refreshAddress()
 
-        when(val ipAddress = getIpAddress()) {
-            is String -> {
-                textViewConnection.setText(R.string.server_running)
-                textViewServerAddress.apply {
-                    visibility = View.VISIBLE
-                    text = resources.getString(
-                        R.string.server_address,
-                        ipAddress,
-                        PiPupService.SERVER_PORT
-                    )
-                }
-            }
-            else -> {
-                textViewConnection.setText(R.string.no_network_connection)
-                textViewServerAddress.visibility = View.INVISIBLE
-            }
+        // 1.1.0: HTTP on/off, MQTT broker and credentials - on the TV, with the remote
+        findViewById<Button>(R.id.buttonSettings)?.setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
         }
-
 
         val serviceIntent = Intent(this, PiPupService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -131,7 +116,32 @@ class MainActivity : Activity() {
         // exemptions from the background-activity-launch restriction, and on a TV without
         // the overlay permission it is the only one available.
         Permissions.onActivityResumed()
+        refreshAddress()   // back from the settings screen: the HTTP switch may have moved
         mHandler.post(mRefresh)
+    }
+
+    /// The header: where the HTTP API answers, or that it is off for the network (1.1.0).
+    private fun refreshAddress() {
+        val textViewConnection = findViewById<TextView>(R.id.textViewConnection)
+        val textViewServerAddress = findViewById<TextView>(R.id.textViewServerAddress)
+        val lan = PiPupService.prefs(this).getBoolean(PiPupService.PREF_HTTP_LAN, true)
+        when (val ipAddress = getIpAddress()) {
+            is String -> {
+                textViewConnection.setText(if (lan) R.string.server_running else R.string.server_lan_off)
+                textViewServerAddress.apply {
+                    visibility = if (lan) View.VISIBLE else View.INVISIBLE
+                    text = resources.getString(
+                        R.string.server_address,
+                        ipAddress,
+                        PiPupService.SERVER_PORT
+                    )
+                }
+            }
+            else -> {
+                textViewConnection.setText(R.string.no_network_connection)
+                textViewServerAddress.visibility = View.INVISIBLE
+            }
+        }
     }
 
     override fun onPause() {
@@ -163,7 +173,7 @@ class MainActivity : Activity() {
             val why: Int?, val fixKey: String?, val adb: String?
         )
 
-        val rows = buildList {
+        val rows = buildList<Row> {
             val overlay = Permissions.granted(this@MainActivity, Permissions.KEY_OVERLAY) == true
             val overlayBlocked = !overlay && Permissions.opBlocked(this@MainActivity, Permissions.KEY_OVERLAY)
             add(Row(
@@ -200,6 +210,27 @@ class MainActivity : Activity() {
                     getString(R.string.permission_power), false, true,
                     R.string.permission_power_why, fixKey,
                     if (fixKey == null) Permissions.adbCommand(Permissions.KEY_ADMIN) else null
+                ))
+            }
+            // 1.1.0: the grants that were adb-only, with a Fix button where the device has a
+            // screen for them. Optional, so never yellow: popups work without them.
+            fun optionalRow(key: String, label: Int, why: Int) {
+                val ok = Permissions.granted(this@MainActivity, key) == true
+                val fixKey = key.takeIf { !ok && Permissions.fixIntent(this@MainActivity, it) != null }
+                add(Row(
+                    getString(label), ok, true,
+                    if (ok) null else why, fixKey,
+                    if (!ok && fixKey == null) Permissions.adbCommand(key) else null
+                ))
+            }
+            optionalRow(Permissions.KEY_MEDIA, R.string.permission_media, R.string.permission_media_why)
+            optionalRow(Permissions.KEY_USAGE, R.string.permission_usage, R.string.permission_usage_why)
+            // Android 13+: a runtime prompt, which this visible activity may show itself
+            Permissions.granted(this@MainActivity, Permissions.KEY_NOTIFICATIONS)?.let { ok ->
+                add(Row(
+                    getString(R.string.permission_notifications), ok, true,
+                    if (ok) null else R.string.permission_notifications_why,
+                    Permissions.KEY_NOTIFICATIONS.takeIf { !ok }, null
                 ))
             }
         }
@@ -253,7 +284,10 @@ class MainActivity : Activity() {
                 Button(this).apply {
                     text = getString(R.string.permission_fix)
                     isFocusable = true
-                    setOnClickListener { Permissions.launchFix(this@MainActivity, fixKey) }
+                    setOnClickListener {
+                        if (fixKey == Permissions.KEY_NOTIFICATIONS) requestNotificationPermission()
+                        else Permissions.launchFix(this@MainActivity, fixKey)
+                    }
                 },
                 LinearLayout.LayoutParams(
                     LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -270,6 +304,16 @@ class MainActivity : Activity() {
             })
         }
         return row
+    }
+
+    /// Android 13+ (1.1.0): the one permission that is a prompt, not a settings screen.
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        try {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIFICATIONS)
+        } catch (ex: Throwable) {
+            android.util.Log.e(LOG_TAG, "Cannot ask for the notification permission: ${ex.message}")
+        }
     }
 
     /// Live status block below the server address. Fetched from the service's own
@@ -364,5 +408,6 @@ class MainActivity : Activity() {
         const val REFRESH_INTERVAL_MS = 2000L
         private const val LOG_TAG = "PiPup"
         private const val REQ_INSTALL_CONFIRM = 4101
+        private const val REQ_NOTIFICATIONS = 4102
     }
 }

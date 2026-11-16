@@ -1243,7 +1243,7 @@ request and keeps nothing. `/state.control.screen` says whether `/screen.jpg` an
 
 | Property      | Value                                                    |
 | ------------- | -------------------------------------------------------- |
-| Path:         | /permissions/fix[?what=overlay\|install\|admin\|accessibility\|next] |
+| Path:         | /permissions/fix[?what=overlay\|install\|admin\|accessibility\|usage\|media\|next] |
 | Method:       | POST                                                     |
 
 Since 0.8.0. Puts the screen that grants a permission in front of the user and wakes the TV first.
@@ -1276,6 +1276,14 @@ Measured on hardware:
 
 `/state` publishes this as `permissions.fixable`, so a controller can show a button only where it
 leads somewhere.
+
+Since 1.1.0 the status screen also has rows for **what plays** (notification-listener access, for
+`/media`) and **the app in front** (usage access), with a Fix button that opens the system's list of
+apps for that access — find PiPup in it and switch it on — and the adb command where the device has no
+such list; `what=usage` and `what=media` do the same from a controller. On Android 13 and up a
+**Notifications** row asks for the notification permission with the system's own prompt (this one
+only works from the TV: a prompt needs a visible window). All three are optional; popups work without
+them. `what=next` still walks the popup-related grants only.
 
 #### Permissions the device blocks outright
 
@@ -1383,6 +1391,10 @@ Two more keys:
 Like the rest of the API, `/settings` has no authentication: anything on the LAN can change it. Keep
 the TVs on a network you trust.
 
+Since 1.1.0 two more things are set **on the TV only**, in *Settings* on PiPup's status screen, and on
+purpose not here: whether the HTTP server listens on the network at all, and the [MQTT](#mqtt) broker
+with its credentials. `/state` reports both (`http`, `mqtt`), never the password.
+
 ### State
 
 | Property      | Value            |
@@ -1417,9 +1429,19 @@ Returns the current state as JSON:
     "overlay": true, "installPackages": true, "autoStart": null,
     "deviceAdmin": true, "accessibility": false, "complete": true,
     "fixable": { "overlay": false, "install": true, "admin": false, "accessibility": false }
-  }
+  },
+  "http": { "lan": true, "port": 7979 },
+  "mqtt": { "enabled": true, "connected": true, "broker": "broker.lan:1883", "tls": false,
+            "username": "pipup", "topic": "pipup/livingroom", "lastError": null,
+            "connectedSecondsAgo": 3600, "received": 12, "lastReceivedSecondsAgo": 42,
+            "lastTopic": "pipup/livingroom/cmd/notify" }
 }
 ```
+
+Since 1.1.0 `http` and `mqtt` are the two transports as set on the TV's settings screen (see
+[MQTT](#mqtt)); the password is never in it. `permissions` also has `media` (notification-listener
+access, for `/media`) and `notifications` (the Android 13+ notification permission; `null` below 13),
+and `fixable` lists `usage` and `media` too.
 
 Since 1.0.0 `foreground` is [the app in front](#the-app-in-front) (`null` without usage access),
 `permissions.usage` says whether that access is there, and `control` has `screen` and
@@ -1456,7 +1478,64 @@ v0.2.6 `watchdogCleanups` counts how often the overlay watchdog had to force-rem
 ### Discovery
 
 Since v0.2.5 the app advertises itself over mDNS/zeroconf as `_pipup._tcp` (port 7979) with TXT
-records `id` (the stable device id), `name` and `version`, enabling automatic discovery.
+records `id` (the stable device id), `name` and `version`, enabling automatic discovery. Not
+advertised while the HTTP server is switched off for the network (1.1.0).
+
+### MQTT
+
+Since 1.1.0. The TV connects *out* to your broker, so nothing that sends to it needs its address:
+the same API as over HTTP, as topics. Open PiPup on the TV, press **Settings**, switch **MQTT** on
+and enter the broker's host, port, username and password (TLS for `ssl://`, port 8883). The
+settings are on the TV only — `/settings` has no login, and a password that could be set over the
+LAN could also be read, or the TV pointed at another broker, by anything on the LAN. The status line
+on that screen says whether the connection is up, and `/state.mqtt` says the same for a controller.
+
+Every TV has a root topic `<prefix>/<name>`: the prefix is `pipup` unless you change it, the name is
+the device id (the `id` in `/state`) unless you give the TV a friendlier one on the settings screen
+(*Topic name of this TV*, e.g. `livingroom`). The screen shows the resulting command topic. The TV
+also connects to the broker as client `pipup-<name>`, so with several TVs on one broker give each its
+own name: two TVs with the same name would share the topics and keep disconnecting each other.
+
+| Topic | Direction | What |
+| --- | --- | --- |
+| `<root>/cmd/<endpoint>` | to the TV | A request to the `POST /<endpoint>` of the HTTP API: `notify`, `cancel`, `power`, `launch`, `key`, `click`, `volume`, `media`, `media/seek`, `apps`, `state`, `update`, `permissions/fix`, … |
+| `pipup/all/cmd/<endpoint>` | to the TV | The same, to every TV on the broker |
+| `<root>/result/<endpoint>` | from the TV | The answer: `{"status": 200, "body": …}`, with the body parsed when it is JSON. A picture (`screen.jpg`, `media/art`) is published as the bytes themselves. |
+| `<root>/state` | from the TV | The `/state` JSON plus `event`, **retained**, on every change — what the [webhook](#settings) gets |
+| `<root>/event` | from the TV | The same message, not retained: one per event, for automations that trigger on `popup_removed`, `media`, … |
+| `<root>/availability` | from the TV | `online` / `offline`, retained; `offline` is the last will, so it also appears when the TV drops off |
+
+The payload of `notify` is the popup JSON, exactly as for `POST /notify`. For every other endpoint
+the payload is a JSON object whose fields are the query parameters of the HTTP call — `{"state":"on"}`
+is `/power?state=on`, `{"all":true}` is `/cancel?all=true` — or empty for a call without parameters.
+Multipart uploads (an image file) are HTTP only. A payload over 256 KB is answered with status 413.
+
+```yaml
+# Home Assistant: a popup over MQTT
+service: mqtt.publish
+data:
+  topic: pipup/livingroom/cmd/notify
+  payload: '{"title": "Doorbell", "message": "Someone is at the door", "duration": 10}'
+```
+
+```shell
+mosquitto_sub -h broker -t 'pipup/#' -v                                  # watch everything
+mosquitto_pub -h broker -t pipup/livingroom/cmd/notify -m '{"title":"hi"}'
+mosquitto_pub -h broker -t pipup/livingroom/cmd/cancel -m '{"all":true}'
+mosquitto_pub -h broker -t pipup/livingroom/cmd/state -n                 # answer on …/result/state
+```
+
+Both transports go through the same code, so whatever `POST` accepts, the topic accepts, and a popup
+from either can be cancelled from the other. The broker's login is the authentication: PiPup trusts
+every message on its topics. The password is kept in the app's private preferences on the TV.
+Reconnects are automatic; a broker that is down when the TV starts is retried every 30 s.
+
+#### HTTP on or off
+
+The same settings screen has **HTTP server on the network**. Off, port 7979 answers on loopback only:
+the app's own screens keep working, nothing on the LAN can reach the API, mDNS stops advertising it,
+and the [ha-pipup](https://github.com/mhoogenbosch/ha-pipup) integration and the install scripts
+cannot talk to the TV. With both switches off nothing can send a popup; the screen says so.
 
 ## Building
 
